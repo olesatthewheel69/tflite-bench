@@ -16,7 +16,7 @@ jobs:
       - name: встановити залежності
         run: |
           python -m pip install -q --upgrade pip numpy
-          python -m pip install -q ai-edge-litert || python -m pip install -q tensorflow-cpu
+          python -m pip install -q ai-edge-litert || python -m pip install -q tensorflow-cpu || python -m pip install -q py-cpuinfo
       - name: замір
         run: python bench.py --out result-${{ matrix.runner }}.json
       - uses: actions/upload-artifact@v4
