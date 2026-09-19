@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import glob, json, os, platform, re, subprocess, sys, time
+import glob, json, os, platform, re, sys, time
 import numpy as np
 
 def get_interpreter():
@@ -14,6 +14,7 @@ def get_interpreter():
 
 FLAGS = ["avx2", "avx512f", "avx512_vnni", "amx_int8",
          "asimddp", "i8mm", "sve", "sve2", "bf16"]
+MODES = ["f32", "dynrange", "fp16", "int8"]
 
 def cpu_info():
     d = {"machine": platform.machine(), "system": platform.system(),
@@ -21,7 +22,7 @@ def cpu_info():
     nz = lambda s: s.replace("_", "").lower()
     want = {nz(f): f for f in FLAGS}
     try:
-        import cpuinfo                                  # працює і на Windows, і на Linux
+        import cpuinfo
         i = cpuinfo.get_cpu_info()
         d["model"] = i.get("brand_raw") or d["model"]
         have = {nz(x) for x in i.get("flags", [])}
@@ -45,7 +46,7 @@ def run(Interp, path, X, threads, warm=30, reps=400):
     it = Interp(model_path=path, num_threads=threads); it.allocate_tensors()
     i, o = it.get_input_details()[0], it.get_output_details()[0]
     dt, (sc, zp) = i["dtype"], i["quantization"]
-    if dt in (np.int8, np.uint8):                      # вхід квантований
+    if dt in (np.int8, np.uint8):
         lo, hi = np.iinfo(dt).min, np.iinfo(dt).max
         Xq = [np.clip(np.round(x/sc + zp), lo, hi).astype(dt) for x in X]
     else:
@@ -71,33 +72,44 @@ if __name__ == "__main__":
     Interp, pkg = get_interpreter()
     X = [x[None] for x in np.load("bench/samples.npy").astype("float32")]
     lab = np.load("bench/labels.npy")
-    models = {os.path.basename(p)[6:-7]: p                       # final_<tag>.tflite
-              for p in sorted(glob.glob("bench/final_*.tflite"))}
-    if not models: sys.exit("не знайдено bench/final_*.tflite")
+
+    found = {}                                      # {модель: {варіант: шлях}}
+    for p in sorted(glob.glob("bench/*.tflite")):
+        stem = os.path.basename(p)[:-7]
+        if "_" not in stem: continue
+        name, mode = stem.rsplit("_", 1)
+        found.setdefault(name, {})[mode] = p
+    if not found: sys.exit("не знайдено bench/*.tflite")
 
     ci = cpu_info()
     print(f"{ci['model']} | {ci['machine']} | ядер {ci['cores']} | "
           f"прапорці: {ci['flags'] or '—'}\nінтерпретатор: {pkg}")
-    print(f"моделі: {', '.join(models)}\n")
+    print(f"моделей: {len(found)}, файлів: {sum(len(v) for v in found.values())}\n")
 
-    res, ref = {"cpu": ci, "runtime": pkg, "runs": {}}, None
-    for th in (1, os.cpu_count()):
+    threads = list(range(1, (os.cpu_count() or 1) + 1))
+    res = {"cpu": ci, "runtime": pkg, "runs": {}}
+
+    for th in threads:
         print(f"--- потоків = {th} ---")
-        for tag, path in models.items():
-            r, pr = run(Interp, path, X, th)
-            if tag == "f32": ref = pr
-            r["acc"] = round(float((pr == lab).mean()), 4)
-            r["agree_f32"] = round(float((pr == ref).mean()), 4) if ref is not None else None
-            res["runs"][f"{tag}_t{th}"] = r
-            print(f"{tag:10} {r['in_dtype']:>7}  медіана {r['median']:7.4f} мс "
-                  f"[{r['p10']:.4f}–{r['p90']:.4f}]  {r['kB']:6.1f} КБ  "
-                  f"acc={r['acc']:.4f}  згода={r['agree_f32']}")
-        b = res["runs"][f"f32_t{th}"]["median"]
-        for tag in models:
-            v = res["runs"][f"{tag}_t{th}"]["median"]
-            print(f"    {tag:10} / f32 = {v/b:.3f}" + (f"  (×{b/v:.2f})" if v < b else ""))
+        for name in sorted(found):
+            ref = None
+            for mode in [m for m in MODES if m in found[name]]:
+                r, pr = run(Interp, found[name][mode], X, th)
+                if mode == "f32": ref = pr
+                r.update(model=name, mode=mode, threads=th,
+                         acc=round(float((pr == lab).mean()), 4),
+                         agree_f32=round(float((pr == ref).mean()), 4)
+                                   if ref is not None else None)
+                base = res["runs"].get(f"{name}_f32_t{th}")
+                r["vs_f32"] = round(base["median"]/r["median"], 3) if base else 1.0
+                res["runs"][f"{name}_{mode}_t{th}"] = r
+                print(f"{name:8} {mode:9} {r['in_dtype']:>7} "
+                      f"{r['median']:8.4f} мс  {r['kB']:7.1f} КБ  "
+                      f"acc={r['acc']:.4f}  згода={r['agree_f32']}  "
+                      f"×{r['vs_f32']:.2f}")
         print()
 
     name = re.sub(r"[^A-Za-z0-9]+", "-", ci["model"])[:40]
     out = sys.argv[sys.argv.index("--out")+1] if "--out" in sys.argv else f"result-{name}.json"
-    json.dump(res, open(out, "w"), ensure_ascii=False, indent=1); print("записано:", out)
+    json.dump(res, open(out, "w"), ensure_ascii=False, indent=1)
+    print("записано:", out)
