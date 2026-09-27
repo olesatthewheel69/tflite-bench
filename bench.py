@@ -1,115 +1,87 @@
-#!/usr/bin/env python3
-import glob, json, os, platform, re, sys, time
+import csv
+import glob
+import os
+import platform
+import re
+import time
+from datetime import datetime, timezone
+from importlib.metadata import version
+
 import numpy as np
 
-def get_interpreter():
-    for mod, pkg in (("ai_edge_litert.interpreter", "ai-edge-litert"),
-                     ("tflite_runtime.interpreter", "tflite-runtime"),
-                     ("tensorflow.lite",            "tensorflow")):
-        try:
-            return __import__(mod, fromlist=["Interpreter"]).Interpreter, pkg
-        except Exception:
-            continue
-    sys.exit("не знайдено інтерпретатора TFLite")
+try:
+    from ai_edge_litert.interpreter import Interpreter
+    runtime = "ai-edge-litert " + version("ai-edge-litert")
+except ImportError:
+    import tensorflow
+    from tensorflow.lite import Interpreter
+    runtime = "tensorflow " + tensorflow.__version__
 
 FLAGS = ["avx2", "avx512f", "avx512_vnni", "amx_int8",
          "asimddp", "i8mm", "sve", "sve2", "bf16"]
-MODES = ["f32", "dynrange", "fp16", "int8"]
+WARMUP = 30
+REPEATS = 400
 
-def cpu_info():
-    d = {"machine": platform.machine(), "system": platform.system(),
-         "cores": os.cpu_count(), "model": platform.processor() or "?", "flags": []}
-    nz = lambda s: s.replace("_", "").lower()
-    want = {nz(f): f for f in FLAGS}
-    try:
-        import cpuinfo
-        i = cpuinfo.get_cpu_info()
-        d["model"] = i.get("brand_raw") or d["model"]
-        have = {nz(x) for x in i.get("flags", [])}
-        d["flags"] = [want[k] for k in want if k in have]
-        return d
-    except Exception:
-        pass
-    try:
-        txt = open("/proc/cpuinfo").read()
-        m = re.search(r"^(?:model name|Model name)\s*:\s*(.+)$", txt, re.M)
-        if m: d["model"] = m.group(1).strip()
-        f = re.search(r"^(?:flags|Features)\s*:\s*(.+)$", txt, re.M)
-        if f:
-            have = {nz(x) for x in f.group(1).split()}
-            d["flags"] = [want[k] for k in want if k in have]
-    except FileNotFoundError:
-        pass
-    return d
+cpu = platform.processor() or "unknown"
+flags = []
+try:
+    import cpuinfo
+    info = cpuinfo.get_cpu_info()
+    cpu = info.get("brand_raw") or cpu
+    have = {flag.replace("_", "").lower() for flag in info.get("flags", [])}
+    flags = [flag for flag in FLAGS if flag.replace("_", "").lower() in have]
+except Exception:
+    pass
 
-def run(Interp, path, X, threads, warm=30, reps=400):
-    it = Interp(model_path=path, num_threads=threads); it.allocate_tensors()
-    i, o = it.get_input_details()[0], it.get_output_details()[0]
-    dt, (sc, zp) = i["dtype"], i["quantization"]
-    if dt in (np.int8, np.uint8):
-        lo, hi = np.iinfo(dt).min, np.iinfo(dt).max
-        Xq = [np.clip(np.round(x/sc + zp), lo, hi).astype(dt) for x in X]
-    else:
-        Xq = [x.astype(dt) for x in X]
-    for k in range(warm):
-        it.set_tensor(i["index"], Xq[k % len(Xq)]); it.invoke()
-    ts, preds = [], []
-    for k in range(reps):
-        x = Xq[k % len(Xq)]
-        t0 = time.perf_counter()
-        it.set_tensor(i["index"], x); it.invoke(); out = it.get_tensor(o["index"])
-        ts.append(time.perf_counter() - t0)
-        preds.append(int(np.argmax(out)))
-    ts = 1000 * np.array(ts)
-    return (dict(median=round(float(np.median(ts)), 4), mean=round(float(ts.mean()), 4),
-                 p10=round(float(np.percentile(ts, 10)), 4),
-                 p90=round(float(np.percentile(ts, 90)), 4),
-                 kB=round(os.path.getsize(path)/1024, 1),
-                 in_dtype=str(np.dtype(dt))),
-            np.array(preds[:len(X)]))
+samples = np.load("bench/samples.npy").astype("float32")
+labels = np.load("bench/labels.npy")
+run = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+name = re.sub(r"[^A-Za-z0-9]+", "-", cpu).strip("-")[:40]
+paths = sorted(glob.glob("bench/*.tflite"))
+print(cpu, platform.machine(), flags, runtime, len(paths), "files")
 
-if __name__ == "__main__":
-    Interp, pkg = get_interpreter()
-    X = [x[None] for x in np.load("bench/samples.npy").astype("float32")]
-    lab = np.load("bench/labels.npy")
+rows = []
+accuracy = {}
+for threads in range(1, (os.cpu_count() or 1) + 1):
+    for path in paths:
+        model, mode = os.path.basename(path)[:-len(".tflite")].rsplit("_", 1)
+        interpreter = Interpreter(model_path=path, num_threads=threads)
+        interpreter.allocate_tensors()
+        details = interpreter.get_input_details()[0]
+        output = interpreter.get_output_details()[0]
+        scale, zero = details["quantization"]
+        data = samples
+        if details["dtype"] == np.int8:
+            data = np.round(samples / scale + zero)
+            data = np.clip(data, -128, 127).astype(np.int8)
 
-    found = {}                                      # {модель: {варіант: шлях}}
-    for p in sorted(glob.glob("bench/*.tflite")):
-        stem = os.path.basename(p)[:-7]
-        if "_" not in stem: continue
-        name, mode = stem.rsplit("_", 1)
-        found.setdefault(name, {})[mode] = p
-    if not found: sys.exit("не знайдено bench/*.tflite")
+        if path not in accuracy:
+            correct = 0
+            for k in range(len(data)):
+                interpreter.set_tensor(details["index"], data[k][None])
+                interpreter.invoke()
+                predicted = interpreter.get_tensor(output["index"]).argmax()
+                correct += int(predicted == labels[k])
+            accuracy[path] = correct / len(data)
 
-    ci = cpu_info()
-    print(f"{ci['model']} | {ci['machine']} | ядер {ci['cores']} | "
-          f"прапорці: {ci['flags'] or '—'}\nінтерпретатор: {pkg}")
-    print(f"моделей: {len(found)}, файлів: {sum(len(v) for v in found.values())}\n")
+        times = []
+        for k in range(WARMUP + REPEATS):
+            interpreter.set_tensor(details["index"], data[k % len(data)][None])
+            begin = time.perf_counter()
+            interpreter.invoke()
+            if k >= WARMUP:
+                times.append(time.perf_counter() - begin)
 
-    threads = list(range(1, (os.cpu_count() or 1) + 1))
-    res = {"cpu": ci, "runtime": pkg, "runs": {}}
+        rows.append({"run": run, "platform": name, "cpu": cpu,
+                     "arch": platform.machine(), "flags": ";".join(flags),
+                     "runtime": runtime, "threads": threads, "model": model,
+                     "mode": mode, "ms": round(1000 * np.median(times), 4),
+                     "accuracy": round(accuracy[path], 4)})
+        print(threads, model, mode, rows[-1]["ms"], rows[-1]["accuracy"])
 
-    for th in threads:
-        print(f"--- потоків = {th} ---")
-        for name in sorted(found):
-            ref = None
-            for mode in [m for m in MODES if m in found[name]]:
-                r, pr = run(Interp, found[name][mode], X, th)
-                if mode == "f32": ref = pr
-                r.update(model=name, mode=mode, threads=th,
-                         acc=round(float((pr == lab).mean()), 4),
-                         agree_f32=round(float((pr == ref).mean()), 4)
-                                   if ref is not None else None)
-                base = res["runs"].get(f"{name}_f32_t{th}")
-                r["vs_f32"] = round(base["median"]/r["median"], 3) if base else 1.0
-                res["runs"][f"{name}_{mode}_t{th}"] = r
-                print(f"{name:8} {mode:9} {r['in_dtype']:>7} "
-                      f"{r['median']:8.4f} мс  {r['kB']:7.1f} КБ  "
-                      f"acc={r['acc']:.4f}  згода={r['agree_f32']}  "
-                      f"×{r['vs_f32']:.2f}")
-        print()
-
-    name = re.sub(r"[^A-Za-z0-9]+", "-", ci["model"])[:40]
-    out = sys.argv[sys.argv.index("--out")+1] if "--out" in sys.argv else f"result-{name}.json"
-    json.dump(res, open(out, "w"), ensure_ascii=False, indent=1)
-    print("записано:", out)
+filename = f"result-{name}-{run}.csv"
+with open(filename, "w", newline="") as file:
+    writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+print("saved", filename)
